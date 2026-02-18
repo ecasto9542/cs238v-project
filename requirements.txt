@@ -1,0 +1,4 @@
+highway-env>=1.9.1
+gymnasium>=0.29
+numpy>=1.24
+pandas>=2.0
