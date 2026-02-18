@@ -2,7 +2,7 @@
 
 Starter repository for "Validation of Autonomous Driving Policies Under Actuation Delays" using [Highway-Env](https://github.com/Farama-Foundation/HighwayEnv).
 
-## 2) Run a first experiment
+## Run a first experiment
 
 ```bash
 python scripts/run_delay_experiment.py
@@ -17,7 +17,7 @@ Outputs:
 - rollout-level CSV: `results/delay_results.csv`
 - terminal summary: collision rate vs. delay and traffic
 
-## 3) Control experiment settings
+## Control experiment settings
 
 Example custom run:
 
@@ -41,7 +41,7 @@ With `--policy-frequency 5`, each control step is `200 ms`, so:
 - `delay_steps=3` -> `600 ms`
 - `delay_steps=5` -> `1000 ms`
 
-## To do next
+## To do next!
 
 - Primary safety metric: collision indicator (`collided`)
 - Optional robustness metric: minimum TTC (`min_ttc`) if provided by the environment info
