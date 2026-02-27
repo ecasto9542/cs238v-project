@@ -2,6 +2,13 @@
 
 Starter repository for "Validation of Autonomous Driving Policies Under Actuation Delays" using [Highway-Env](https://github.com/Farama-Foundation/HighwayEnv).
 
+To install project dependencies:
+  ```python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install --upgrade pip
+  pip install -r requirements.txt
+  ```
+
 ## Run a first experiment
 
 ```bash
