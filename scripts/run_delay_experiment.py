@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run actuation-delay robustness experiments in Highway-Env (non-random baseline)."""
+"""Run actuation-delay validation experiments in Highway-Env."""
 
 from __future__ import annotations
 
@@ -18,6 +18,13 @@ import pandas as pd
 # Highway-Env DiscreteMetaAction mapping is typically:
 # 0: LANE_LEFT, 1: IDLE, 2: LANE_RIGHT, 3: FASTER, 4: SLOWER
 LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER = 0, 1, 2, 3, 4
+ACTION_NAMES = {
+    LANE_LEFT: "LANE_LEFT",
+    IDLE: "IDLE",
+    LANE_RIGHT: "LANE_RIGHT",
+    FASTER: "FASTER",
+    SLOWER: "SLOWER",
+}
 
 
 @dataclass
@@ -28,22 +35,11 @@ class RolloutResult:
     delay_ms: float
     policy: str
     collided: int
-    min_ttc: float
+    failure: int
+    min_headway: float
+    min_ttc_est: float
+    risk_score: float
     steps: int
-
-
-def get_min_ttc_from_info(info: dict) -> float:
-    """Best-effort TTC extraction; returns NaN if env doesn't provide it."""
-    ttc = info.get("time_to_collision")
-    if ttc is None:
-        return float("nan")
-    if isinstance(ttc, (list, tuple, np.ndarray)):
-        arr = np.asarray(ttc, dtype=float)
-        return float(np.nanmin(arr)) if arr.size else float("nan")
-    try:
-        return float(ttc)
-    except (TypeError, ValueError):
-        return float("nan")
 
 
 def choose_action(policy: str, env: gym.Env) -> int:
@@ -57,13 +53,13 @@ def choose_action(policy: str, env: gym.Env) -> int:
 
 
 def heuristic_action(env: gym.Env) -> int:
+    """Simple deterministic baseline controller."""
     vehicle = getattr(env.unwrapped, "vehicle", None)
     road = getattr(env.unwrapped, "road", None)
     if vehicle is None or road is None:
         return IDLE
 
-    # Conservative settings
-    target_speed = 22.0       # m/s (~49 mph)
+    target_speed = 22.0       # m/s
     close_dist = 25.0         # start slowing
     very_close_dist = 15.0    # definitely slow
 
@@ -80,18 +76,72 @@ def heuristic_action(env: gym.Env) -> int:
         if 0 < dx < front_dist:
             front_dist = dx
 
-    # If close to front car: slow down
     if front_dist < very_close_dist:
         return SLOWER
     if front_dist < close_dist:
         return SLOWER
 
-    # Otherwise speed control
     if getattr(vehicle, "speed", target_speed) < target_speed - 1.5:
         return FASTER
     if getattr(vehicle, "speed", target_speed) > target_speed + 2.5:
         return SLOWER
     return IDLE
+
+
+def front_vehicle_metrics(env: gym.Env) -> tuple[float, float]:
+    """
+    Returns:
+        headway: distance to closest front vehicle in same lane
+        ttc_est: estimated TTC = distance / closing_speed if closing_speed > 0, else inf
+    """
+    vehicle = getattr(env.unwrapped, "vehicle", None)
+    road = getattr(env.unwrapped, "road", None)
+    if vehicle is None or road is None:
+        return float("inf"), float("inf")
+
+    my_lane = vehicle.lane_index
+    my_x = float(vehicle.position[0])
+    my_speed = float(getattr(vehicle, "speed", 0.0))
+
+    front = None
+    front_dist = float("inf")
+
+    for other in road.vehicles:
+        if other is vehicle:
+            continue
+        if getattr(other, "lane_index", None) != my_lane:
+            continue
+        dx = float(other.position[0]) - my_x
+        if 0 < dx < front_dist:
+            front_dist = dx
+            front = other
+
+    if front is None:
+        return float("inf"), float("inf")
+
+    front_speed = float(getattr(front, "speed", 0.0))
+    closing_speed = my_speed - front_speed
+
+    if closing_speed > 1e-6:
+        ttc_est = front_dist / closing_speed
+    else:
+        ttc_est = float("inf")
+
+    return front_dist, ttc_est
+
+
+def compute_risk_score(collided: int, min_headway: float, min_ttc_est: float) -> float:
+    """
+    Continuous surrogate objective for falsification.
+    Higher means more dangerous.
+    """
+    if collided:
+        return 1e6
+
+    headway_term = 0.0 if not np.isfinite(min_headway) else 1.0 / max(min_headway, 1e-3)
+    ttc_term = 0.0 if not np.isfinite(min_ttc_est) else 1.0 / max(min_ttc_est, 1e-3)
+
+    return max(headway_term, 2.0 * ttc_term)
 
 
 def run_rollout(
@@ -102,24 +152,43 @@ def run_rollout(
     max_steps: int,
     step_ms: float,
     vehicles_count: int,
+    ttc_threshold: float,
+    inspect_timestep: int | None = None,
 ) -> RolloutResult:
     _, info = env.reset(seed=seed)
 
-    # Delay buffer: prefill with IDLE so the car "does nothing" while actions are delayed in
     action_buffer: Deque[int] = deque([IDLE] * delay_steps, maxlen=delay_steps)
 
     collided = 0
-    min_ttc = float("nan")
     steps = 0
+    min_headway = float("inf")
+    min_ttc_est = float("inf")
 
     for _ in range(max_steps):
         proposed = choose_action(policy, env)
 
         if delay_steps > 0:
+            buffer_before_append = list(action_buffer)
             action_buffer.append(proposed)
+            buffer_after_append = list(action_buffer)
             action = action_buffer.popleft()
+            buffer_after_pop = list(action_buffer)
         else:
+            buffer_before_append = []
+            buffer_after_append = []
+            buffer_after_pop = []
             action = proposed
+
+        if inspect_timestep is not None and steps == inspect_timestep:
+            print("\n--- Delay Buffer Inspection ---")
+            print(f"seed={seed}, vehicles_count={vehicles_count}, delay_steps={delay_steps}")
+            print(f"timestep={steps}")
+            print(f"proposed action={ACTION_NAMES.get(proposed, proposed)}")
+            print(f"buffer before append={[ACTION_NAMES.get(a, a) for a in buffer_before_append]}")
+            print(f"buffer after append={[ACTION_NAMES.get(a, a) for a in buffer_after_append]}")
+            print(f"executed action={ACTION_NAMES.get(action, action)}")
+            print(f"buffer after pop={[ACTION_NAMES.get(a, a) for a in buffer_after_pop]}")
+            print("-------------------------------\n")
 
         _, _, terminated, truncated, info = env.step(action)
         steps += 1
@@ -129,12 +198,21 @@ def run_rollout(
             crashed_flag = int(crashed_flag or bool(getattr(env.unwrapped.vehicle, "crashed", False)))
         collided = max(collided, crashed_flag)
 
-        this_ttc = get_min_ttc_from_info(info)
-        if not np.isnan(this_ttc):
-            min_ttc = this_ttc if np.isnan(min_ttc) else float(min(min_ttc, this_ttc))
+        headway, ttc_est = front_vehicle_metrics(env)
+        min_headway = min(min_headway, headway)
+        min_ttc_est = min(min_ttc_est, ttc_est)
 
         if terminated or truncated:
             break
+
+    near_failure = int(np.isfinite(min_ttc_est) and min_ttc_est < ttc_threshold)
+    failure = int(bool(collided) or bool(near_failure))
+
+    risk_score = compute_risk_score(
+        collided=collided,
+        min_headway=min_headway,
+        min_ttc_est=min_ttc_est,
+    )
 
     return RolloutResult(
         seed=seed,
@@ -143,7 +221,10 @@ def run_rollout(
         delay_ms=delay_steps * step_ms,
         policy=policy,
         collided=collided,
-        min_ttc=min_ttc,
+        failure=failure,
+        min_headway=min_headway if np.isfinite(min_headway) else float("nan"),
+        min_ttc_est=min_ttc_est if np.isfinite(min_ttc_est) else float("nan"),
+        risk_score=risk_score,
         steps=steps,
     )
 
@@ -151,12 +232,13 @@ def run_rollout(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Actuation delay experiments for highway-env")
     p.add_argument("--rollouts", type=int, default=100)
-    p.add_argument("--delays", type=int, nargs="+", default=[0, 1, 2, 3, 4])
-    p.add_argument("--traffic", type=int, nargs="+", default=[15, 25, 35])
+    p.add_argument("--delays", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5])
+    p.add_argument("--traffic", type=int, nargs="+", default=[8, 12, 16, 20])
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--policy", choices=["heuristic", "idle", "random"], default="heuristic")
     p.add_argument("--policy-frequency", type=int, default=5)
     p.add_argument("--simulation-frequency", type=int, default=15)
+    p.add_argument("--ttc-threshold", type=float, default=1.5, help="Failure if estimated TTC drops below this")
     p.add_argument("--output", type=Path, default=Path("results/delay_results.csv"))
     return p.parse_args()
 
@@ -185,20 +267,24 @@ def main() -> None:
         env.reset()
 
         for delay_steps in args.delays:
-            print(f"Running vehicles_count={vehicles_count}, delay_steps={delay_steps} ({delay_steps * step_ms:.0f} ms)")
+            print(
+                f"Running vehicles_count={vehicles_count}, "
+                f"delay_steps={delay_steps} ({delay_steps * step_ms:.0f} ms)"
+            )
             for rollout_idx in range(args.rollouts):
                 seed = 1000 * vehicles_count + 100 * delay_steps + rollout_idx
-                all_results.append(
-                    run_rollout(
-                        env=env,
-                        policy=args.policy,
-                        seed=seed,
-                        delay_steps=delay_steps,
-                        max_steps=args.max_steps,
-                        step_ms=step_ms,
-                        vehicles_count=vehicles_count,
-                    )
+                result = run_rollout(
+                    env=env,
+                    policy=args.policy,
+                    seed=seed,
+                    delay_steps=delay_steps,
+                    max_steps=args.max_steps,
+                    step_ms=step_ms,
+                    vehicles_count=vehicles_count,
+                    ttc_threshold=args.ttc_threshold,
+                    inspect_timestep=args.inspect_timestep,
                 )
+                all_results.append(result)
                 completed += 1
                 if completed % 50 == 0 or completed == total_runs:
                     print(f"Progress: {completed}/{total_runs}")
@@ -212,9 +298,13 @@ def main() -> None:
         df.groupby(["vehicles_count", "delay_steps", "delay_ms"], as_index=False)
         .agg(
             collision_rate=("collided", "mean"),
-            n=("collided", "count"),
+            failure_rate=("failure", "mean"),
             mean_steps=("steps", "mean"),
-            mean_min_ttc=("min_ttc", "mean"),
+            mean_min_headway=("min_headway", "mean"),
+            mean_min_ttc_est=("min_ttc_est", "mean"),
+            mean_risk_score=("risk_score", "mean"),
+            max_risk_score=("risk_score", "max"),
+            n=("failure", "count"),
         )
         .sort_values(["vehicles_count", "delay_steps"])
     )
